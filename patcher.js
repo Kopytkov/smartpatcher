@@ -16,14 +16,40 @@ function lexMatch(text) {
   const tokens = [];
   let i = 0;
   while (i < text.length) {
-    if (/\s/.test(text[i])) { i++; continue; }
-    if (text.startsWith('...', i)) { tokens.push({ type: 'wildcard', text: '...' }); i += 3; continue; }
-    if (text.startsWith('>>>', i)) { tokens.push({ type: 'inserter', text: '>>>' }); i += 3; continue; }
-    if (text.startsWith('<<<', i)) { tokens.push({ type: 'folder', text: '<<<' }); i += 3; continue; }
-    const ch = text[i];
-    if ('{}()[]<>'.includes(ch)) { tokens.push({ type: 'bracket', text: ch }); i++; continue; }
-    if (ch === '"' || ch === "'") {
-      const quote = ch;
+    // 1. Пробелы/табуляции/переносы
+    if (/\s/.test(text[i])) {
+      i++;
+      continue;
+    }
+
+    // 2. Мета‑токены
+    if (text.startsWith('...', i)) {
+      tokens.push({ type: 'wildcard', text: '...' });
+      i += 3;
+      continue;
+    }
+    if (text.startsWith('>>>', i)) {
+      tokens.push({ type: 'inserter', text: '>>>' });
+      i += 3;
+      continue;
+    }
+    if (text.startsWith('<<<', i)) {
+      tokens.push({ type: 'folder', text: '<<<' });
+      i += 3;
+      continue;
+    }
+
+    // 3. Препроцессор‑директива (e.g. #include)
+    const dir = /^#[A-Za-z_]\w*/.exec(text.slice(i));
+    if (dir) {
+      tokens.push({ type: 'directive', text: dir[0] });
+      i += dir[0].length;
+      continue;
+    }
+
+    // 4. Строковый литерал
+    if (text[i] === '"' || text[i] === "'") {
+      const quote = text[i];
       let j = i + 1;
       while (j < text.length && text[j] !== quote) {
         if (text[j] === '\\') j += 2;
@@ -33,27 +59,46 @@ function lexMatch(text) {
       i = j + 1;
       continue;
     }
+    // 5. Комментарии
     if (text.startsWith('//', i)) {
       const end = text.indexOf('\n', i + 2);
-      const com = end < 0 ? text.slice(i) : text.slice(i, end);
-      tokens.push({ type: 'comment', text: com });
+      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end) });
       i = end < 0 ? text.length : end;
       continue;
     }
     if (text.startsWith('/*', i)) {
       const end = text.indexOf('*/', i + 2);
-      const com = end < 0 ? text.slice(i) : text.slice(i, end + 2);
-      tokens.push({ type: 'comment', text: com });
+      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end + 2) });
       i = end < 0 ? text.length : end + 2;
       continue;
     }
-    const m = /^[^\s\.\/"'\(\)\{\}\[\]<>]+/.exec(text.slice(i));
-    if (m) {
-      tokens.push({ type: 'text', text: m[0] });
-      i += m[0].length;
+
+    // 6. Многосимвольные операторы
+    const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<|>>)/.exec(text.slice(i));
+    if (multiOp) {
+      tokens.push({ type: 'operator', text: multiOp[0] });
+      i += multiOp[0].length;
       continue;
     }
-    tokens.push({ type: 'char', text: ch });
+
+    // 7. Идентификаторы
+    const id = /^[A-Za-z_]\w*/.exec(text.slice(i));
+    if (id) {
+      tokens.push({ type: 'identifier', text: id[0] });
+      i += id[0].length;
+      continue;
+    }
+
+    // 8. Числа
+    const num = /^\d+/.exec(text.slice(i));
+    if (num) {
+      tokens.push({ type: 'number', text: num[0] });
+      i += num[0].length;
+      continue;
+    }
+
+    // 9. Всё остальное — одиночный символ
+    tokens.push({ type: 'symbol', text: text[i] });
     i++;
   }
   return tokens;
@@ -76,28 +121,69 @@ function getLeafTokens(src) {
 
 // Поиск оффсета вставки (с поддержкой wildcard)
 function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
-  let s = 0;
-  let offset = null;
-  for (let i = 0; i < patternTokens.length; i++) {
-    const p = patternTokens[i];
-    if (p.type === 'comment' || p.type === 'folder') continue;
+  let insertionOffset = null;
+
+  function recurse(si, pi) {
+    // si — индекс в sourceTokens, pi — в patternTokens
+    if (pi === patternTokens.length) {
+      // дошли до конца паттерна
+      return insertionOffset;
+    }
+
+    const p = patternTokens[pi];
+
+    // Пропускаем комментарии и folder
+    if (p.type === 'comment' || p.type === 'folder') {
+      return recurse(si, pi + 1);
+    }
+
+    // inserter — запоминаем текущую позицию
     if (p.type === 'inserter') {
-      offset = s >= sourceTokens.length ? srcLength : sourceTokens[s].startIndex;
-      continue;
+      insertionOffset = (si >= sourceTokens.length)
+        ? srcLength
+        : sourceTokens[si].startIndex;
+      return recurse(si, pi + 1);
     }
+    // wildcard — умеем прыгать по sourceTokens до следующего значимого токена
     if (p.type === 'wildcard') {
-      const next = patternTokens.slice(i + 1).find(t => !['wildcard','comment','folder','inserter'].includes(t.type));
-      if (next) {
-        while (s < sourceTokens.length && sourceTokens[s].text !== next.text) s++;
-      } else { s = sourceTokens.length; }
-      continue;
+      // ищем следующий «жёсткий» токен в паттерне
+      let nextIdx = pi + 1;
+      while (
+        nextIdx < patternTokens.length &&
+        ['wildcard','comment','folder','inserter'].includes(patternTokens[nextIdx].type)
+      ) {
+        nextIdx++;
+      }
+      // если далее нет литералов — wildcard может съесть всё до конца
+      if (nextIdx >= patternTokens.length) {
+        return recurse(sourceTokens.length, nextIdx);
+      }
+      const nextTok = patternTokens[nextIdx];
+      // для каждого возможного вхождения nextTok в sourceTokens
+      for (let sj = si; sj <= sourceTokens.length; sj++) {
+        if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) {
+          continue;
+        }
+        const r = recurse(sj, pi + 1);
+        if (r != null) return r;
+      }
+      return null;
     }
-    while (s < sourceTokens.length && sourceTokens[s].text !== p.text) s++;
-    if (s >= sourceTokens.length) throw new Error(`Токен '${p.text}' не найден`);
-    s++;
+
+    // жёсткий литерал: должен совпасть с текущим токеном в sourceTokens
+    if (si < sourceTokens.length && sourceTokens[si].text === p.text) {
+      return recurse(si + 1, pi + 1);
+    }
+
+    // иначе — неудача
+    return null;
   }
-  if (offset === null) throw new Error('Нет inserter в паттерне');
-  return offset;
+
+  const result = recurse(0, 0);
+  if (result == null) {
+    throw new Error('Не удалось найти место вставки по паттерну');
+  }
+  return result;
 }
 
 // Извлечение match/patch из Markdown
