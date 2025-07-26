@@ -119,34 +119,52 @@ function getLeafTokens(src) {
   return leaves;
 }
 
-// Поиск оффсета вставки (с поддержкой wildcard)
+// Поиск оффсетов вставки и удаления (с поддержкой wildcard)
 function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
+  // специальный случай: заменить всё
+  if (
+    patternTokens.length === 3 &&
+    patternTokens[0].type === 'inserter' &&
+    patternTokens[1].type === 'wildcard' &&
+    patternTokens[2].type === 'folder'
+  ) {
+    return { insertionOffset: 0, deleteOffset: srcLength };
+  }
+  // специальный случай: вставка в конце кода
+  if (
+    patternTokens.length === 2 &&
+    patternTokens[0].type === 'wildcard' &&
+    patternTokens[1].type === 'inserter'
+  ) {
+    return { insertionOffset: srcLength, deleteOffset: null };
+  }
+
   let insertionOffset = null;
+  let deleteOffset = null;
 
   function recurse(si, pi) {
-    // si — индекс в sourceTokens, pi — в patternTokens
-    if (pi === patternTokens.length) {
-      // дошли до конца паттерна
-      return insertionOffset;
-    }
+    if (pi === patternTokens.length) return insertionOffset;
 
     const p = patternTokens[pi];
-
-    // Пропускаем комментарии и folder
-    if (p.type === 'comment' || p.type === 'folder') {
+    // пропускаем комментарии
+    if (p.type === 'comment') {
       return recurse(si, pi + 1);
     }
-
-    // inserter — запоминаем текущую позицию
+    // inserter — маркер вставки
     if (p.type === 'inserter') {
       insertionOffset = (si >= sourceTokens.length)
         ? srcLength
         : sourceTokens[si].startIndex;
       return recurse(si, pi + 1);
     }
-    // wildcard — умеем прыгать по sourceTokens до следующего значимого токена
+    // folder (<<<) — маркер удаления
+    if (p.type === 'folder') {
+      deleteOffset = (si >= sourceTokens.length)
+        ? srcLength
+        : sourceTokens[si].startIndex;
+      return recurse(si, pi + 1);
+    }
     if (p.type === 'wildcard') {
-      // ищем следующий «жёсткий» токен в паттерне
       let nextIdx = pi + 1;
       while (
         nextIdx < patternTokens.length &&
@@ -154,36 +172,28 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
       ) {
         nextIdx++;
       }
-      // если далее нет литералов — wildcard может съесть всё до конца
       if (nextIdx >= patternTokens.length) {
         return recurse(sourceTokens.length, nextIdx);
       }
       const nextTok = patternTokens[nextIdx];
-      // для каждого возможного вхождения nextTok в sourceTokens
       for (let sj = si; sj <= sourceTokens.length; sj++) {
-        if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) {
-          continue;
-        }
+        if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) continue;
         const r = recurse(sj, pi + 1);
         if (r != null) return r;
       }
       return null;
     }
-
-    // жёсткий литерал: должен совпасть с текущим токеном в sourceTokens
     if (si < sourceTokens.length && sourceTokens[si].text === p.text) {
       return recurse(si + 1, pi + 1);
     }
-
-    // иначе — неудача
     return null;
   }
 
-  const result = recurse(0, 0);
-  if (result == null) {
+  recurse(0, 0);
+  if (insertionOffset == null) {
     throw new Error('Не удалось найти место вставки по паттерну');
   }
-  return result;
+  return { insertionOffset, deleteOffset };
 }
 
 // Извлечение match/patch из Markdown
@@ -211,7 +221,7 @@ async function main() {
 
   const patt = lexMatch(match);
   const srcTokens = getLeafTokens(src);
-  const offset = findInsertionOffset(srcTokens, patt, src.length);
+  const { insertionOffset: offset, deleteOffset } = findInsertionOffset(srcTokens, patt, src.length);
 
   // --- Новый блок для корректной вставки ---
   let beforeRaw = src.slice(0, offset);
@@ -247,7 +257,11 @@ async function main() {
   const insertText = (needsNl ? '\n' : '') + patchedLines;
   // --- Конец нового блока ---
 
-  const result = beforeBase + insertText + src.slice(offset);
+  // если есть deleteOffset и он после insertOffset — удаляем участок
+  const tailStart = (deleteOffset != null && deleteOffset > offset)
+  ? deleteOffset
+  : offset;
+  const result = beforeBase + insertText + src.slice(tailStart);
   fs.mkdirSync(path.dirname(argv.out), { recursive: true });
   fs.writeFileSync(argv.out, result, 'utf8');
   console.log(`Patched at byte offset ${offset}`);
