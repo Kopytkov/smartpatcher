@@ -10,6 +10,7 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import Parser from 'tree-sitter';
 import Cpp from 'tree-sitter-cpp';
+import { execSync } from 'child_process';
 
 // Лексер для match-блока
 function lexMatch(text) {
@@ -257,14 +258,57 @@ async function main() {
   const insertText = (needsNl ? '\n' : '') + patchedLines;
   // --- Конец нового блока ---
 
-  // если есть deleteOffset и он после insertOffset — удаляем участок
+  // Если есть deleteOffset и он после insertOffset — удаляем участок
   const tailStart = (deleteOffset != null && deleteOffset > offset)
-  ? deleteOffset
-  : offset;
+    ? deleteOffset
+    : offset;
   const result = beforeBase + insertText + src.slice(tailStart);
   fs.mkdirSync(path.dirname(argv.out), { recursive: true });
   fs.writeFileSync(argv.out, result, 'utf8');
   console.log(`Patched at byte offset ${offset}`);
+
+  // Вычисляем позицию курсора в конце вставленного текста
+  const beforeLines = beforeBase.split('\n');
+  let cursorLine = beforeLines.length;
+  let cursorColumn = (beforeLines[beforeLines.length - 1] || '').length + insertText.length + 1;
+
+  // Вычисляем начальную позицию для подсветки (начало patch)
+  let startLine = cursorLine - 1; // Нумерация в VSCode с 0
+  let startCol;
+  if (isInline) {
+    // Для inline: начало — это позиция курсора минус длина patch
+    startCol = cursorColumn - patch.trim().length - 1;
+  } else {
+    // Для многострочного: начало — это начало первой строки patch, учитывая indent
+    startCol = indent.length;
+  }
+
+  // Формируем команду для открытия файла в VSCode
+  const filePath = path.resolve(argv.out);
+  const codeCmd = `code --goto "${filePath}:${cursorLine}:${cursorColumn}"`;
+
+  // Формируем URI для подсветки через расширение
+  const encodedPath = encodeURIComponent(filePath);
+  const uri = `vscode://DK.vscode-smartpatch-highlighter?path=${encodedPath}&startLine=${startLine}&startCol=${startCol}&endLine=${cursorLine - 1}&endCol=${cursorColumn - 1}`;
+
+  // Выполняем команды
+  try {
+    // Открываем файл в VSCode
+    execSync(codeCmd, { stdio: 'inherit' });
+
+    // Вызываем URI для подсветки
+    let openUriCmd;
+    if (process.platform === 'win32') {
+      openUriCmd = `start "" "${uri}"`;
+    } else if (process.platform === 'darwin') {
+      openUriCmd = `open "${uri}"`;
+    } else {
+      openUriCmd = `xdg-open "${uri}"`;
+    }
+    execSync(openUriCmd, { stdio: 'inherit' });
+  } catch (err) {
+    console.error(err.message);
+  }
 }
 
 main().catch(e => {
