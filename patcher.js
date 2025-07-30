@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * CLI-утилита на Node.js для применения Markdown-патчей к C++-файлам без готового парсера.
- * Учитывает отступы, расположение `>>>` на той же строке или в новой, а также вставку внутри строки.
+ * CLI-утилита на Node.js для применения Markdown-патчей к C++-файлам с учетом вложенности.
+ * Учитывает отступы, расположение `>>>` и уровень вложенности скобок `{}`.
  */
 import fs from 'fs';
 import path from 'path';
@@ -12,10 +12,12 @@ import Parser from 'tree-sitter';
 import Cpp from 'tree-sitter-cpp';
 import { execSync } from 'child_process';
 
-// Лексер для match-блока
+// Лексер для match-блока с учетом вложенности
 function lexMatch(text) {
   const tokens = [];
   let i = 0;
+  let nestingLevel = 0; // Уровень вложенности
+
   while (i < text.length) {
     // 1. Пробелы/табуляции/переносы
     if (/\s/.test(text[i])) {
@@ -25,17 +27,17 @@ function lexMatch(text) {
 
     // 2. Мета‑токены
     if (text.startsWith('...', i)) {
-      tokens.push({ type: 'wildcard', text: '...' });
+      tokens.push({ type: 'wildcard', text: '...', nestingLevel });
       i += 3;
       continue;
     }
     if (text.startsWith('>>>', i)) {
-      tokens.push({ type: 'inserter', text: '>>>' });
+      tokens.push({ type: 'inserter', text: '>>>', nestingLevel });
       i += 3;
       continue;
     }
     if (text.startsWith('<<<', i)) {
-      tokens.push({ type: 'folder', text: '<<<' });
+      tokens.push({ type: 'folder', text: '<<<', nestingLevel });
       i += 3;
       continue;
     }
@@ -43,7 +45,7 @@ function lexMatch(text) {
     // 3. Препроцессор‑директива (e.g. #include)
     const dir = /^#[A-Za-z_]\w*/.exec(text.slice(i));
     if (dir) {
-      tokens.push({ type: 'directive', text: dir[0] });
+      tokens.push({ type: 'directive', text: dir[0], nestingLevel });
       i += dir[0].length;
       continue;
     }
@@ -52,24 +54,58 @@ function lexMatch(text) {
     if (text[i] === '"' || text[i] === "'") {
       const quote = text[i];
       let j = i + 1;
+      let stringParts = [];
+      let start = j;
+
       while (j < text.length && text[j] !== quote) {
-        if (text[j] === '\\') j += 2;
-        else j++;
+        if (text[j] === '\\') {
+          // Пропускаем экранированные символы
+          j += 2;
+          continue;
+        }
+        // Проверяем на наличие >>> или <<< внутри строки
+        if (text.startsWith('>>>', j) || text.startsWith('<<<', j)) {
+          if (start < j) {
+            // Сохраняем текст до мета-токена как часть строки
+            stringParts.push({ type: 'string', text: text.slice(start, j), nestingLevel });
+          }
+          const metaType = text.startsWith('>>>', j) ? 'inserter' : 'folder';
+          stringParts.push({ type: metaType, text: text.slice(j, j + 3), nestingLevel });
+          j += 3;
+          start = j;
+          continue;
+        }
+        j++;
       }
-      tokens.push({ type: 'string', text: text.slice(i, j + 1) });
-      i = j + 1;
+
+      // Сохраняем оставшуюся часть строки, если она есть
+      if (start < j) {
+        stringParts.push({ type: 'string', text: text.slice(start, j), nestingLevel });
+      }
+
+      // Добавляем открывающую кавычку
+      tokens.push({ type: 'string', text: quote, nestingLevel });
+      // Добавляем все части строки и мета-токены
+      tokens.push(...stringParts);
+      // Добавляем закрывающую кавычку, если она есть
+      if (j < text.length && text[j] === quote) {
+        tokens.push({ type: 'string', text: quote, nestingLevel });
+        j++;
+      }
+      i = j;
       continue;
     }
+    
     // 5. Комментарии
     if (text.startsWith('//', i)) {
       const end = text.indexOf('\n', i + 2);
-      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end) });
+      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end), nestingLevel });
       i = end < 0 ? text.length : end;
       continue;
     }
     if (text.startsWith('/*', i)) {
       const end = text.indexOf('*/', i + 2);
-      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end + 2) });
+      tokens.push({ type: 'comment', text: text.slice(i, end < 0 ? undefined : end + 2), nestingLevel });
       i = end < 0 ? text.length : end + 2;
       continue;
     }
@@ -77,7 +113,7 @@ function lexMatch(text) {
     // 6. Многосимвольные операторы
     const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<|>>)/.exec(text.slice(i));
     if (multiOp) {
-      tokens.push({ type: 'operator', text: multiOp[0] });
+      tokens.push({ type: 'operator', text: multiOp[0], nestingLevel });
       i += multiOp[0].length;
       continue;
     }
@@ -85,7 +121,7 @@ function lexMatch(text) {
     // 7. Идентификаторы
     const id = /^[A-Za-z_]\w*/.exec(text.slice(i));
     if (id) {
-      tokens.push({ type: 'identifier', text: id[0] });
+      tokens.push({ type: 'identifier', text: id[0], nestingLevel });
       i += id[0].length;
       continue;
     }
@@ -93,36 +129,53 @@ function lexMatch(text) {
     // 8. Числа
     const num = /^\d+/.exec(text.slice(i));
     if (num) {
-      tokens.push({ type: 'number', text: num[0] });
+      tokens.push({ type: 'number', text: num[0], nestingLevel });
       i += num[0].length;
       continue;
     }
 
-    // 9. Всё остальное — одиночный символ
-    tokens.push({ type: 'symbol', text: text[i] });
+    // 9. Скобки (отслеживаем вложенность)
+    if (/[{(}\[\])]/.test(text[i])) {
+      if (text[i] === '{') nestingLevel++;
+      tokens.push({ type: 'bracket', text: text[i], nestingLevel });
+      if (text[i] === '}') nestingLevel--;
+      i++;
+      continue;
+    }
+
+    // 10. Всё остальное — одиночный символ
+    tokens.push({ type: 'symbol', text: text[i], nestingLevel });
     i++;
   }
   return tokens;
 }
 
-// Собирает листовые токены из AST C++
+// Собирает листовые токены из AST C++ с учетом вложенности
 function getLeafTokens(src) {
   const parser = new Parser();
   parser.setLanguage(Cpp);
   const tree = parser.parse(src);
   const leaves = [];
-  function walk(node) {
+
+  function walk(node, nestingLevel = 0) {
+    if (node.type === 'compound_statement') {
+      nestingLevel++; // Увеличиваем уровень при входе в блок
+    }
     if (node.childCount === 0) {
-      leaves.push({ text: node.text, startIndex: node.startIndex });
-    } else { for (let i = 0; i < node.childCount; i++) walk(node.child(i)); }
+      leaves.push({ text: node.text, startIndex: node.startIndex, nestingLevel });
+    } else {
+      for (let i = 0; i < node.childCount; i++) {
+        walk(node.child(i), nestingLevel);
+      }
+    }
   }
   walk(tree.rootNode);
   return leaves;
 }
 
-// Поиск оффсетов вставки и удаления (с поддержкой wildcard)
+// Поиск оффсетов вставки и удаления с учетом вложенности
 function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
-  // специальный случай: заменить всё
+  // Специальный случай: заменить всё
   if (
     patternTokens.length === 3 &&
     patternTokens[0].type === 'inserter' &&
@@ -131,7 +184,7 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
   ) {
     return { insertionOffset: 0, deleteOffset: srcLength };
   }
-  // специальный случай: вставка в конце кода
+  // Специальный случай: вставка в конце кода
   if (
     patternTokens.length === 2 &&
     patternTokens[0].type === 'wildcard' &&
@@ -143,54 +196,65 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
   let insertionOffset = null;
   let deleteOffset = null;
 
-  function recurse(si, pi) {
+  function recurse(si, pi, currentNestingLevel = 0) {
     if (pi === patternTokens.length) return insertionOffset;
 
     const p = patternTokens[pi];
-    // пропускаем комментарии
+    // Пропускаем комментарии
     if (p.type === 'comment') {
-      return recurse(si, pi + 1);
+      return recurse(si, pi + 1, currentNestingLevel);
     }
-    // inserter — маркер вставки
+    // Inserter — маркер вставки
     if (p.type === 'inserter') {
       insertionOffset = (si >= sourceTokens.length)
         ? srcLength
         : sourceTokens[si].startIndex;
-      return recurse(si, pi + 1);
+      return recurse(si, pi + 1, currentNestingLevel);
     }
-    // folder (<<<) — маркер удаления
+    // Folder (<<<) — маркер удаления
     if (p.type === 'folder') {
       deleteOffset = (si >= sourceTokens.length)
         ? srcLength
         : sourceTokens[si].startIndex;
-      return recurse(si, pi + 1);
+      return recurse(si, pi + 1, currentNestingLevel);
     }
+    // Wildcard с учетом вложенности
     if (p.type === 'wildcard') {
       let nextIdx = pi + 1;
       while (
         nextIdx < patternTokens.length &&
-        ['wildcard','comment','folder','inserter'].includes(patternTokens[nextIdx].type)
+        ['wildcard', 'comment', 'folder', 'inserter'].includes(patternTokens[nextIdx].type)
       ) {
         nextIdx++;
       }
       if (nextIdx >= patternTokens.length) {
-        return recurse(sourceTokens.length, nextIdx);
+        return recurse(sourceTokens.length, nextIdx, currentNestingLevel);
       }
       const nextTok = patternTokens[nextIdx];
       for (let sj = si; sj <= sourceTokens.length; sj++) {
-        if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) continue;
-        const r = recurse(sj, pi + 1);
+        // Проверяем, чтобы уровень вложенности совпадал
+        if (sj < sourceTokens.length && sourceTokens[sj].nestingLevel !== p.nestingLevel) {
+          continue;
+        }
+        if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) {
+          continue;
+        }
+        // Если это '}', проверяем, чтобы уровень вложенности совпадал с ожидаемым
+        if (sj < sourceTokens.length && nextTok.text === '}' && sourceTokens[sj].nestingLevel !== nextTok.nestingLevel) {
+          continue;
+        }
+        const r = recurse(sj, pi + 1, sourceTokens[sj]?.nestingLevel || currentNestingLevel);
         if (r != null) return r;
       }
       return null;
     }
-    if (si < sourceTokens.length && sourceTokens[si].text === p.text) {
-      return recurse(si + 1, pi + 1);
+    if (si < sourceTokens.length && sourceTokens[si].text === p.text && sourceTokens[si].nestingLevel === p.nestingLevel) {
+      return recurse(si + 1, pi + 1, sourceTokens[si].nestingLevel);
     }
     return null;
   }
 
-  recurse(0, 0);
+  recurse(0, 0, 0);
   if (insertionOffset == null) {
     throw new Error('Не удалось найти место вставки по паттерну');
   }
@@ -215,7 +279,6 @@ async function main() {
   const md = fs.readFileSync(argv.mp, 'utf8');
   const { match, patch } = extractBlocks(md);
 
-  // Inline или новая строка?
   const matchLines = match.split(/\r?\n/);
   const inserterLine = matchLines.find(line => line.includes('>>>')) || '';
   const isInline = inserterLine.trim() !== '>>>';
@@ -224,11 +287,11 @@ async function main() {
   const srcTokens = getLeafTokens(src);
   const { insertionOffset: offset, deleteOffset } = findInsertionOffset(srcTokens, patt, src.length);
 
-  // --- Новый блок для корректной вставки ---
+  // --- Подготовка вставки ---
   let beforeRaw = src.slice(0, offset);
   const lastNlIdx = beforeRaw.lastIndexOf('\n');
   const afterLastNl = beforeRaw.slice(lastNlIdx + 1);
-  const indent = afterLastNl.match(/^\s*/)[0];
+  const indent = afterLastNl.match(/^\s*/)?.[0] || '';
 
   // Если строка-плейсхолдер пустая — убираем её
   const isPlaceholderLine = /^[\s]*$/.test(afterLastNl);
@@ -256,7 +319,6 @@ async function main() {
       .join('\n');
   }
   const insertText = (needsNl ? '\n' : '') + patchedLines;
-  // --- Конец нового блока ---
 
   // Если есть deleteOffset и он после insertOffset — удаляем участок
   const tailStart = (deleteOffset != null && deleteOffset > offset)
@@ -267,33 +329,32 @@ async function main() {
   fs.writeFileSync(argv.out, result, 'utf8');
   console.log(`Patched at byte offset ${offset}`);
 
-  // Вычисляем позицию курсора в конце вставленного текста
+  // --- Подсветка и позиционирование курсора ---
+  const patchLines = patch.trim().split(/\r?\n/);
+  const patchLineCount = patchLines.length;
+
   const beforeLines = beforeBase.split('\n');
-  let cursorLine = beforeLines.length;
-  let cursorColumn = (beforeLines[beforeLines.length - 1] || '').length + insertText.length + 1;
+  const startLine = beforeLines.length;
+  const startCol = isInline
+    ? (beforeLines[beforeLines.length - 1] || '').length
+    : indent.length;
 
-  // Вычисляем начальную позицию для подсветки (начало patch)
-  let startLine = cursorLine - 1; // Нумерация в VSCode с 0
-  let startCol;
-  if (isInline) {
-    // Для inline: начало — это позиция курсора минус длина patch
-    startCol = cursorColumn - patch.trim().length - 1;
-  } else {
-    // Для многострочного: начало — это начало первой строки patch, учитывая indent
-    startCol = indent.length;
-  }
+  const endLine = startLine + patchLineCount - 1;
+  const endCol = isInline
+    ? startCol + patchLines[0].length
+    : patchLines[patchLineCount - 1].length + indent.length;
 
-  // Формируем команду для открытия файла в VSCode
+  const cursorLine = endLine;
+  const cursorColumn = endCol + 1; // курсор после последнего символа
+
   const filePath = path.resolve(argv.out);
   const codeCmd = `code --goto "${filePath}:${cursorLine}:${cursorColumn}"`;
 
   // Формируем URI для подсветки через расширение
   const encodedPath = encodeURIComponent(filePath);
-  const uri = `vscode://DK.vscode-smartpatch-highlighter?path=${encodedPath}&startLine=${startLine}&startCol=${startCol}&endLine=${cursorLine - 1}&endCol=${cursorColumn - 1}`;
+  const uri = `vscode://DK.vscode-smartpatch-highlighter?path=${encodedPath}&startLine=${startLine-1}&startCol=${startCol}&endLine=${endLine-1}&endCol=${endCol}`;
 
-  // Выполняем команды
   try {
-    // Открываем файл в VSCode
     execSync(codeCmd, { stdio: 'inherit' });
 
     // Вызываем URI для подсветки
