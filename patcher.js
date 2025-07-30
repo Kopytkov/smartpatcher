@@ -56,7 +56,6 @@ function lexMatch(text) {
       let j = i + 1;
       let stringParts = [];
       let start = j;
-
       while (j < text.length && text[j] !== quote) {
         if (text[j] === '\\') {
           // Пропускаем экранированные символы
@@ -158,8 +157,8 @@ function getLeafTokens(src) {
   const leaves = [];
 
   function walk(node, nestingLevel = 0) {
-    if (node.type === 'compound_statement') {
-      nestingLevel++; // Увеличиваем уровень при входе в блок
+    if (node.type === 'compound_statement' || node.type === 'class_specifier') {
+      nestingLevel++;
     }
     if (node.childCount === 0) {
       leaves.push({ text: node.text, startIndex: node.startIndex, nestingLevel });
@@ -197,7 +196,9 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
   let deleteOffset = null;
 
   function recurse(si, pi, currentNestingLevel = 0) {
-    if (pi === patternTokens.length) return insertionOffset;
+    if (pi === patternTokens.length) {
+      return insertionOffset;
+    }
 
     const p = patternTokens[pi];
     // Пропускаем комментарии
@@ -232,9 +233,14 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
       }
       const nextTok = patternTokens[nextIdx];
       for (let sj = si; sj <= sourceTokens.length; sj++) {
-        // Проверяем, чтобы уровень вложенности совпадал
-        if (sj < sourceTokens.length && sourceTokens[sj].nestingLevel !== p.nestingLevel) {
-          continue;
+        // Если предыдущий токен в паттерне — '{', а следующий — '>>>', разрешаем вставку сразу после '{'
+        if (
+          pi > 0 &&
+          patternTokens[pi - 1].text === '{' &&
+          nextTok.type === 'inserter'
+        ) {
+          insertionOffset = sourceTokens[sj - 1].startIndex + 1;
+          return recurse(sj, nextIdx, sourceTokens[sj - 1].nestingLevel + 1);
         }
         if (sj < sourceTokens.length && sourceTokens[sj].text !== nextTok.text) {
           continue;
@@ -248,7 +254,12 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
       }
       return null;
     }
-    if (si < sourceTokens.length && sourceTokens[si].text === p.text && sourceTokens[si].nestingLevel === p.nestingLevel) {
+    // Позволяем небольшое расхождение в nestingLevel для '{'
+    if (
+      si < sourceTokens.length &&
+      sourceTokens[si].text === p.text &&
+      (p.type !== 'bracket' || Math.abs(sourceTokens[si].nestingLevel - p.nestingLevel) <= 1)
+    ) {
       return recurse(si + 1, pi + 1, sourceTokens[si].nestingLevel);
     }
     return null;
