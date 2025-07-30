@@ -334,15 +334,25 @@ async function main() {
   const patchLineCount = patchLines.length;
 
   const beforeLines = beforeBase.split('\n');
-  const startLine = beforeLines.length;
-  const startCol = isInline
-    ? (beforeLines[beforeLines.length - 1] || '').length
-    : indent.length;
+  let startLine, startCol, endLine, endCol;
 
-  const endLine = startLine + patchLineCount - 1;
-  const endCol = isInline
-    ? startCol + patchLines[0].length
-    : patchLines[patchLineCount - 1].length + indent.length;
+  // Специальный случай: вставка в конец файла
+  if (offset === src.length) {
+    startLine = beforeLines.length + 1; // Начинаем с новой строки после конца файла
+    startCol = 0; // Начало строки
+    endLine = startLine + patchLineCount - 1;
+    endCol = patchLines[patchLineCount - 1].length + indent.length;
+  } else {
+    // Обычная логика для других случаев
+    startLine = beforeLines.length;
+    startCol = isInline
+      ? (beforeLines[beforeLines.length - 1] || '').length
+      : indent.length;
+    endLine = startLine + patchLineCount - 1;
+    endCol = isInline
+      ? startCol + patchLines[0].length
+      : patchLines[patchLineCount - 1].length + indent.length;
+  }
 
   const cursorLine = endLine;
   const cursorColumn = endCol + 1; // курсор после последнего символа
