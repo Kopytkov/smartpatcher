@@ -174,6 +174,17 @@ function getLeafTokens(src) {
 
 // Поиск оффсетов вставки и удаления с учетом вложенности
 function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
+  // Проверка на некорректный match-блок
+  for (let i = 0; i < patternTokens.length - 2; i++) {
+    if (
+      patternTokens[i].type === 'wildcard' &&
+      patternTokens[i + 1].type === 'inserter' &&
+      patternTokens[i + 2].type === 'wildcard'
+    ) {
+      throw new Error('Некорректный match-блок.');
+    }
+  }
+
   // Специальный случай: заменить всё
   if (
     patternTokens.length === 3 &&
