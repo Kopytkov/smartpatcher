@@ -110,7 +110,7 @@ function lexMatch(text) {
     }
 
     // 6. Многосимвольные операторы
-    const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<|>>)/.exec(text.slice(i));
+    const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<=|>>=|<<|>>|\+=|-=|\*=|\/=|%=|&=|\|=|\^=|::)/.exec(text.slice(i));
     if (multiOp) {
       tokens.push({ type: 'operator', text: multiOp[0], nestingLevel });
       i += multiOp[0].length;
@@ -125,8 +125,8 @@ function lexMatch(text) {
       continue;
     }
 
-    // 8. Числа
-    const num = /^\d+/.exec(text.slice(i));
+    // 8. Числа (целые и вещественные)
+    const num = /^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?/.exec(text.slice(i));
     if (num) {
       tokens.push({ type: 'number', text: num[0], nestingLevel });
       i += num[0].length;
