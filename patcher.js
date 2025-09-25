@@ -18,6 +18,38 @@ function lexMatch(text) {
   let i = 0;
   let nestingLevel = 0; // Уровень вложенности
 
+  // Вспомогательная функция для извлечения следующего токена
+  function extractNextToken(start) {
+    let j = start;
+    while (j < text.length && /\s/.test(text[j])) {
+      j++;
+    }
+    if (j >= text.length) {
+      return { token: null, newPos: j };
+    }
+    // Мета-токены
+    if (['._.', '...', '>>>', '<<<'].includes(text.slice(j, j + 3))) {
+      return { token: null, newPos: j };
+    }
+    // Многосимвольные операторы
+    const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<=|>>=|<<|>>|\+=|-=|\*=|\/=|%=|&=|\|=|\^=|::)/.exec(text.slice(j));
+    if (multiOp) {
+      return { token: multiOp[0], newPos: j + multiOp[0].length };
+    }
+    // Идентификатор
+    const id = /^[A-Za-z_]\w*/.exec(text.slice(j));
+    if (id) {
+      return { token: id[0], newPos: j + id[0].length };
+    }
+    // Число
+    const num = /^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?/.exec(text.slice(j));
+    if (num) {
+      return { token: num[0], newPos: j + num[0].length };
+    }
+    // Одиночный символ
+    return { token: text[j], newPos: j + 1 };
+  }
+
   while (i < text.length) {
     // 1. Пробелы/табуляции/переносы
     if (/\s/.test(text[i])) {
@@ -26,6 +58,12 @@ function lexMatch(text) {
     }
 
     // 2. Мета‑токены
+    if (text.startsWith('._.', i)) {
+      const { token: target, newPos } = extractNextToken(i + 3);
+      tokens.push({ type: 'skipper', text: '._.', nestingLevel, target });
+      i = newPos;
+      continue;
+    }
     if (text.startsWith('...', i)) {
       tokens.push({ type: 'wildcard', text: '...', nestingLevel });
       i += 3;
@@ -62,13 +100,13 @@ function lexMatch(text) {
           j += 2;
           continue;
         }
-        // Проверяем на наличие >>> или <<< внутри строки
-        if (text.startsWith('>>>', j) || text.startsWith('<<<', j)) {
+        // Проверяем на наличие >>>, <<< или ._. внутри строки
+        if (text.startsWith('>>>', j) || text.startsWith('<<<', j) || text.startsWith('._.', j)) {
           if (start < j) {
             // Сохраняем текст до мета-токена как часть строки
             stringParts.push({ type: 'string', text: text.slice(start, j), nestingLevel });
           }
-          const metaType = text.startsWith('>>>', j) ? 'inserter' : 'folder';
+          const metaType = text.startsWith('>>>', j) ? 'inserter' : text.startsWith('<<<', j) ? 'folder' : 'skipper';
           stringParts.push({ type: metaType, text: text.slice(j, j + 3), nestingLevel });
           j += 3;
           start = j;
@@ -110,26 +148,26 @@ function lexMatch(text) {
     }
 
     // 6. Многосимвольные операторы
-    const multiOp = /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<=|>>=|<<|>>|\+=|-=|\*=|\/=|%=|&=|\|=|\^=|::)/.exec(text.slice(i));
-    if (multiOp) {
-      tokens.push({ type: 'operator', text: multiOp[0], nestingLevel });
-      i += multiOp[0].length;
+    const { token: opToken, newPos: opPos } = extractNextToken(i);
+    if (opToken && /^(==|!=|<=|>=|\+\+|--|->|&&|\|\||<<=|>>=|<<|>>|\+=|-=|\*=|\/=|%=|&=|\|=|\^=|::)/.test(opToken)) {
+      tokens.push({ type: 'operator', text: opToken, nestingLevel });
+      i = opPos;
       continue;
     }
 
     // 7. Идентификаторы
-    const id = /^[A-Za-z_]\w*/.exec(text.slice(i));
-    if (id) {
-      tokens.push({ type: 'identifier', text: id[0], nestingLevel });
-      i += id[0].length;
+    const { token: idToken, newPos: idPos } = extractNextToken(i);
+    if (idToken && /^[A-Za-z_]\w*/.test(idToken)) {
+      tokens.push({ type: 'identifier', text: idToken, nestingLevel });
+      i = idPos;
       continue;
     }
 
     // 8. Числа (целые и вещественные)
-    const num = /^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?/.exec(text.slice(i));
-    if (num) {
-      tokens.push({ type: 'number', text: num[0], nestingLevel });
-      i += num[0].length;
+    const { token: numToken, newPos: numPos } = extractNextToken(i);
+    if (numToken && /^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?/.test(numToken)) {
+      tokens.push({ type: 'number', text: numToken, nestingLevel });
+      i = numPos;
       continue;
     }
 
@@ -230,12 +268,42 @@ function findInsertionOffset(sourceTokens, patternTokens, srcLength) {
         : sourceTokens[si].startIndex;
       return recurse(si, pi + 1, currentNestingLevel);
     }
+    // Skipper (._.) — пропуск до первого вхождения target или до следующего токена
+    if (p.type === 'skipper') {
+      let nextIdx = pi + 1;
+      while (
+        nextIdx < patternTokens.length &&
+        ['comment', 'inserter', 'folder', 'skipper'].includes(patternTokens[nextIdx].type)
+      ) {
+        nextIdx++;
+      }
+      if (p.target) {
+        // Ищем target в sourceTokens
+        for (let sj = si; sj < sourceTokens.length; sj++) {
+          if (sourceTokens[sj].text === p.target) {
+            return recurse(sj + 1, pi + 1, sourceTokens[sj].nestingLevel);
+          }
+        }
+        return null; // target не найден
+      } else if (nextIdx < patternTokens.length) {
+        // Нет target, ищем следующий токен в паттерне
+        const nextTok = patternTokens[nextIdx];
+        for (let sj = si; sj < sourceTokens.length; sj++) {
+          if (sourceTokens[sj].text === nextTok.text) {
+            return recurse(sj, pi + 1, sourceTokens[sj].nestingLevel);
+          }
+        }
+        return null; // следующий токен не найден
+      }
+      // Если нет target и нет следующего токена, пропускаем до конца
+      return recurse(sourceTokens.length, pi + 1, currentNestingLevel);
+    }
     // Wildcard с учетом вложенности
     if (p.type === 'wildcard') {
       let nextIdx = pi + 1;
       while (
         nextIdx < patternTokens.length &&
-        ['wildcard', 'comment', 'folder', 'inserter'].includes(patternTokens[nextIdx].type)
+        ['wildcard', 'comment', 'folder', 'inserter', 'skipper'].includes(patternTokens[nextIdx].type)
       ) {
         nextIdx++;
       }
